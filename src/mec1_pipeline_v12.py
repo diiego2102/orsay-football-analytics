@@ -1,0 +1,1235 @@
+"""
+MEC-1.2 — Motor Estadístico de Clubes v1.2
+======================================
+
+Pipeline inicial para predicción prepartido de fútbol de clubes:
+- Ingesta histórica desde football-data.org.
+- Bronze/Silver/Gold como Parquet comprimido con gzip y extensión .gzip.
+- Feature engineering sin leakage temporal.
+- Modelos Poisson para goles 1T y 2T.
+- Rating Elo prepartido sin leakage.
+- Matriz de marcadores con opción Dixon-Coles para resultados bajos.
+- Decisión 1X2 con clasificación de incertidumbre.
+- MEC-1.2: calibración de probabilidades 1X2, bandas H/D/A y diversidad de scorelines.
+- Exportación a Excel.
+
+Requisitos:
+    pip install pandas numpy requests scipy scikit-learn openpyxl pyarrow
+
+Variable de entorno recomendada:
+    FOOTBALL_DATA_API_TOKEN=<tu_token>
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from pathlib import Path
+import gzip
+import json
+import os
+import sys
+import time
+import random
+from typing import Dict, Iterable, List, Optional, Tuple
+
+from requests.exceptions import SSLError, ConnectionError, Timeout, RequestException
+
+import numpy as np
+import pandas as pd
+import requests
+from scipy.stats import poisson
+from sklearn.compose import ColumnTransformer
+from sklearn.impute import SimpleImputer
+from sklearn.linear_model import PoissonRegressor
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import OneHotEncoder, StandardScaler
+
+
+def resolve_project_root() -> Path:
+    """PROJECT_ROOT robusto: funciona desde notebooks/ o desde la raíz."""
+    PROJECT_ROOT = Path.cwd()
+    if PROJECT_ROOT.name.lower() == "notebooks":
+        PROJECT_ROOT = PROJECT_ROOT.parent
+    if str(PROJECT_ROOT) not in sys.path:
+        sys.path.insert(0, str(PROJECT_ROOT))
+    return PROJECT_ROOT
+
+
+def ensure_project_dirs(project_root: Path) -> Dict[str, Path]:
+    paths = {
+        "raw_football_data": project_root / "data" / "raw" / "football_data",
+        "raw_statsbomb": project_root / "data" / "raw" / "statsbomb",
+        "bronze": project_root / "data" / "bronze",
+        "silver": project_root / "data" / "silver",
+        "gold": project_root / "data" / "gold",
+        "outputs_excel": project_root / "outputs" / "excel",
+        "outputs_charts": project_root / "outputs" / "charts",
+    }
+    for path in paths.values():
+        path.mkdir(parents=True, exist_ok=True)
+    return paths
+
+
+def parquet_gzip_path(folder: Path, name: str) -> Path:
+    """
+    Devuelve ruta .gzip. El contenido es Parquet comprimido con gzip.
+    Se lee con pd.read_parquet().
+    """
+    return folder / f"{name}.gzip"
+
+
+def save_parquet_gzip(df: pd.DataFrame, output_path: Path) -> Path:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    df.to_parquet(output_path, compression="gzip", index=False)
+    return output_path
+
+
+def read_parquet_gzip(input_path: Path) -> pd.DataFrame:
+    return pd.read_parquet(input_path)
+
+
+def save_json_gzip(obj: dict, output_path: Path) -> Path:
+    """Solo raw JSON. Bronze/Silver/Gold se guardan en Parquet gzip."""
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with gzip.open(output_path, "wt", encoding="utf-8") as f:
+        json.dump(obj, f, ensure_ascii=False)
+    return output_path
+
+
+def read_json_gzip(input_path: Path) -> dict:
+    with gzip.open(input_path, "rt", encoding="utf-8") as f:
+        return json.load(f)
+
+
+@dataclass
+class FootballDataClient:
+    api_token: Optional[str] = None
+    base_url: str = "https://api.football-data.org/v4"
+    sleep_seconds: float = 6.5
+    timeout: int = 30
+
+    def __post_init__(self):
+        if self.api_token is None:
+            self.api_token = os.getenv("FOOTBALL_DATA_API_TOKEN")
+
+        if not self.api_token:
+            raise ValueError(
+                "No se encontró FOOTBALL_DATA_API_TOKEN. "
+                "Crea un archivo .env en la raíz del proyecto o define la variable de entorno."
+            )
+
+        self.session = requests.Session()
+        self.session.headers.update({"X-Auth-Token": self.api_token})
+
+    def _reset_session(self) -> None:
+        try:
+            self.session.close()
+        except Exception:
+            pass
+        self.session = requests.Session()
+        self.session.headers.update({"X-Auth-Token": self.api_token})
+
+    def get(self, endpoint: str, params: Optional[dict] = None) -> dict:
+        url = f"{self.base_url}/{endpoint.lstrip('/')}"
+        max_attempts = 5
+        base_sleep = 8
+        last_error = None
+
+        for attempt in range(1, max_attempts + 1):
+            try:
+                response = self.session.get(url, params=params, timeout=self.timeout)
+
+                if response.status_code == 429:
+                    retry_after = int(response.headers.get("Retry-After", "65"))
+                    wait = retry_after + random.uniform(1, 5)
+                    print(f"[429] Rate limit. Esperando {wait:.1f}s...")
+                    time.sleep(wait)
+                    continue
+
+                if response.status_code == 403:
+                    raise PermissionError(
+                        f"football-data.org devolvió 403.\n"
+                        f"URL: {response.url}\n"
+                        f"Respuesta: {response.text[:500]}\n"
+                        f"Revisa token, plan o acceso a la competición/temporada."
+                    )
+
+                if response.status_code == 404:
+                    raise requests.HTTPError(
+                        f"football-data.org devolvió 404. URL: {response.url}",
+                        response=response,
+                    )
+
+                response.raise_for_status()
+                return response.json()
+
+            except (SSLError, ConnectionError, Timeout) as e:
+                last_error = e
+                wait = base_sleep * attempt + random.uniform(1, 5)
+                print(f"[NETWORK RETRY {attempt}/{max_attempts}] {type(e).__name__}: {str(e)[:180]}")
+                print(f"Esperando {wait:.1f}s y reintentando...")
+                time.sleep(wait)
+                self._reset_session()
+
+            except RequestException as e:
+                last_error = e
+                wait = base_sleep * attempt + random.uniform(1, 5)
+                print(f"[REQUEST RETRY {attempt}/{max_attempts}] {type(e).__name__}: {str(e)[:180]}")
+                print(f"Esperando {wait:.1f}s y reintentando...")
+                time.sleep(wait)
+
+        raise RuntimeError(
+            f"No se pudo completar la solicitud tras {max_attempts} intentos.\n"
+            f"URL: {url}\n"
+            f"Params: {params}\n"
+            f"Último error: {repr(last_error)}"
+        )
+
+
+DEFAULT_COMPETITIONS = ["PL", "PD", "SA", "BL1", "FL1", "DED", "PPL", "CL"]
+
+
+def fetch_competition_matches(
+    client: FootballDataClient,
+    competitions: Iterable[str],
+    seasons: Iterable[int],
+    raw_dir: Path,
+    force: bool = False,
+) -> List[Path]:
+    saved_files: List[Path] = []
+    for comp in competitions:
+        for season in seasons:
+            output = raw_dir / f"matches_{comp}_{season}.json.gz"
+            if output.exists() and not force:
+                print(f"[OK] Raw existe: {output.name}")
+                saved_files.append(output)
+                continue
+            print(f"[GET] {comp} season={season}")
+            try:
+                payload = client.get(f"competitions/{comp}/matches", params={"season": season})
+                save_json_gzip(payload, output)
+                saved_files.append(output)
+                time.sleep(client.sleep_seconds)
+
+            except PermissionError as e:
+                print(f"[SKIP 403] Sin acceso a {comp} season={season}. Se omite.")
+                print(str(e)[:500])
+                continue
+
+            except requests.HTTPError as e:
+                status_code = e.response.status_code if e.response is not None else None
+                if status_code == 404:
+                    print(f"[SKIP 404] No existe {comp} season={season}. Se omite.")
+                    continue
+                raise
+
+            except RuntimeError as e:
+                print(f"[SKIP NETWORK] Falló {comp} season={season} después de varios reintentos. Se omite.")
+                print(str(e)[:700])
+                continue
+
+    if not saved_files:
+        raise RuntimeError("No se descargó ni encontró ningún raw válido para modelar.")
+
+    return saved_files
+
+
+def normalize_football_data_matches(raw_files: Iterable[Path]) -> pd.DataFrame:
+    rows = []
+    for file in raw_files:
+        payload = read_json_gzip(file)
+        for m in payload.get("matches", []):
+            score = m.get("score") or {}
+            ft = score.get("fullTime") or {}
+            ht = score.get("halfTime") or {}
+            comp = m.get("competition") or {}
+            season = m.get("season") or {}
+            home = m.get("homeTeam") or {}
+            away = m.get("awayTeam") or {}
+            rows.append({
+                "source": "football-data.org",
+                "competition_id": comp.get("id"),
+                "competition_code": comp.get("code"),
+                "competition_name": comp.get("name"),
+                "season_start_year": season.get("startDate", "")[:4] if season.get("startDate") else None,
+                "match_id": m.get("id"),
+                "utc_date": m.get("utcDate"),
+                "status": m.get("status"),
+                "stage": m.get("stage"),
+                "group": m.get("group"),
+                "matchday": m.get("matchday"),
+                "home_team_id": home.get("id"),
+                "home_team_name": home.get("name"),
+                "away_team_id": away.get("id"),
+                "away_team_name": away.get("name"),
+                "ft_home_goals": ft.get("home"),
+                "ft_away_goals": ft.get("away"),
+                "ht_home_goals": ht.get("home"),
+                "ht_away_goals": ht.get("away"),
+                "last_updated": m.get("lastUpdated"),
+            })
+    df = pd.DataFrame(rows)
+    if df.empty:
+        return df
+    df["utc_date"] = pd.to_datetime(df["utc_date"], errors="coerce", utc=True)
+    df["last_updated"] = pd.to_datetime(df["last_updated"], errors="coerce", utc=True)
+    num_cols = [
+        "competition_id", "season_start_year", "match_id", "matchday", "home_team_id", "away_team_id",
+        "ft_home_goals", "ft_away_goals", "ht_home_goals", "ht_away_goals"
+    ]
+    for col in num_cols:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+    return df.drop_duplicates("match_id").sort_values(["utc_date", "match_id"]).reset_index(drop=True)
+
+
+# StatsBomb Open Data queda como extractor opcional para MEC-2/MEC-1 enriquecido.
+STATSBOMB_RAW_BASE = "https://raw.githubusercontent.com/statsbomb/open-data/master/data"
+
+
+def fetch_statsbomb_competitions(raw_dir: Path, force: bool = False) -> Path:
+    output = raw_dir / "competitions.json.gz"
+    if output.exists() and not force:
+        return output
+    r = requests.get(f"{STATSBOMB_RAW_BASE}/competitions.json", timeout=60)
+    r.raise_for_status()
+    return save_json_gzip(r.json(), output)
+
+
+def normalize_statsbomb_competitions(raw_file: Path) -> pd.DataFrame:
+    return pd.json_normalize(read_json_gzip(raw_file))
+
+
+def filter_finished_matches(matches: pd.DataFrame) -> pd.DataFrame:
+    df = matches.copy()
+    df = df[df["status"].eq("FINISHED")]
+    df = df.dropna(subset=["utc_date", "home_team_id", "away_team_id", "ft_home_goals", "ft_away_goals"])
+    df = df.dropna(subset=["ht_home_goals", "ht_away_goals"])
+    for col in ["ft_home_goals", "ft_away_goals", "ht_home_goals", "ht_away_goals"]:
+        df[col] = df[col].astype(int)
+    df["sh_home_goals"] = df["ft_home_goals"] - df["ht_home_goals"]
+    df["sh_away_goals"] = df["ft_away_goals"] - df["ht_away_goals"]
+    return df.sort_values(["utc_date", "match_id"]).reset_index(drop=True)
+
+
+def build_team_match_long(matches_finished: pd.DataFrame) -> pd.DataFrame:
+    rows = []
+    for _, m in matches_finished.iterrows():
+        base = {
+            "match_id": m["match_id"],
+            "competition_code": m["competition_code"],
+            "competition_name": m["competition_name"],
+            "season_start_year": m["season_start_year"],
+            "utc_date": m["utc_date"],
+            "matchday": m["matchday"],
+        }
+        sides = [
+            (1, m["home_team_id"], m["home_team_name"], m["away_team_id"], m["away_team_name"],
+             m["ft_home_goals"], m["ft_away_goals"], m["ht_home_goals"], m["ht_away_goals"], m["sh_home_goals"], m["sh_away_goals"]),
+            (0, m["away_team_id"], m["away_team_name"], m["home_team_id"], m["home_team_name"],
+             m["ft_away_goals"], m["ft_home_goals"], m["ht_away_goals"], m["ht_home_goals"], m["sh_away_goals"], m["sh_home_goals"]),
+        ]
+        for is_home, team_id, team_name, opp_id, opp_name, gf, ga, ht_gf, ht_ga, sh_gf, sh_ga in sides:
+            points = 3 if gf > ga else 1 if gf == ga else 0
+            rows.append({
+                **base,
+                "team_id": team_id,
+                "team_name": team_name,
+                "opponent_id": opp_id,
+                "opponent_name": opp_name,
+                "is_home": is_home,
+                "gf": gf,
+                "ga": ga,
+                "gd": gf - ga,
+                "points": points,
+                "win": int(points == 3),
+                "draw": int(points == 1),
+                "loss": int(points == 0),
+                "clean_sheet": int(ga == 0),
+                "failed_to_score": int(gf == 0),
+                "btts": int(gf > 0 and ga > 0),
+                "over25": int(gf + ga > 2.5),
+                "ht_gf": ht_gf,
+                "ht_ga": ht_ga,
+                "ht_gd": ht_gf - ht_ga,
+                "sh_gf": sh_gf,
+                "sh_ga": sh_ga,
+                "sh_gd": sh_gf - sh_ga,
+            })
+    return pd.DataFrame(rows).sort_values(["team_id", "utc_date", "match_id"]).reset_index(drop=True)
+
+
+BASE_PERFORMANCE_COLS = [
+    "gf", "ga", "gd", "points", "win", "draw", "loss", "clean_sheet",
+    "failed_to_score", "btts", "over25", "ht_gf", "ht_ga", "ht_gd", "sh_gf", "sh_ga", "sh_gd"
+]
+
+
+def add_rolling_team_features(team_long: pd.DataFrame, windows: Tuple[int, ...] = (5, 10), min_periods: int = 3) -> pd.DataFrame:
+    df = team_long.copy().sort_values(["team_id", "utc_date", "match_id"]).reset_index(drop=True)
+    df["prev_match_date"] = df.groupby("team_id")["utc_date"].shift(1)
+    df["days_rest"] = ((df["utc_date"] - df["prev_match_date"]).dt.total_seconds() / 86400.0).clip(0, 30)
+    for w in windows:
+        for col in BASE_PERFORMANCE_COLS:
+            df[f"roll{w}_{col}"] = df.groupby("team_id", group_keys=False)[col].transform(
+                lambda s: s.shift(1).rolling(w, min_periods=min_periods).mean()
+            )
+            df[f"roll{w}_ha_{col}"] = df.groupby(["team_id", "is_home"], group_keys=False)[col].transform(
+                lambda s: s.shift(1).rolling(w, min_periods=max(2, min_periods - 1)).mean()
+            )
+    return df
+
+
+def expected_elo_score(rating_a: float, rating_b: float) -> float:
+    """Probabilidad esperada Elo de A contra B."""
+    return 1.0 / (1.0 + 10.0 ** ((rating_b - rating_a) / 400.0))
+
+
+def build_elo_features(
+    matches_finished: pd.DataFrame,
+    initial_rating: float = 1500.0,
+    k_factor: float = 20.0,
+    home_advantage_elo: float = 60.0,
+) -> pd.DataFrame:
+    """
+    Calcula rating Elo prepartido sin leakage.
+
+    Cada fila de salida contiene ratings ANTES del partido.
+    Luego se actualizan los ratings con el resultado real.
+    """
+    ratings: Dict[int, float] = {}
+    rows = []
+
+    df = matches_finished.sort_values(["utc_date", "match_id"]).copy()
+
+    for _, m in df.iterrows():
+        home_id = int(m["home_team_id"])
+        away_id = int(m["away_team_id"])
+
+        home_rating = ratings.get(home_id, initial_rating)
+        away_rating = ratings.get(away_id, initial_rating)
+
+        home_rating_adj = home_rating + home_advantage_elo
+        exp_home = expected_elo_score(home_rating_adj, away_rating)
+        exp_away = 1.0 - exp_home
+
+        gd = int(m["ft_home_goals"]) - int(m["ft_away_goals"])
+        if gd > 0:
+            actual_home = 1.0
+        elif gd == 0:
+            actual_home = 0.5
+        else:
+            actual_home = 0.0
+        actual_away = 1.0 - actual_home
+
+        # Multiplicador simple por margen de gol. Mantiene estabilidad del baseline.
+        margin_multiplier = 1.0 if abs(gd) <= 1 else np.log(abs(gd) + 1.0)
+        k_eff = k_factor * margin_multiplier
+
+        rows.append({
+            "match_id": m["match_id"],
+            "home_elo_pre": home_rating,
+            "away_elo_pre": away_rating,
+            "home_elo_pre_adj": home_rating_adj,
+            "elo_diff": home_rating - away_rating,
+            "elo_diff_home_adj": home_rating_adj - away_rating,
+            "elo_expected_home": exp_home,
+            "elo_expected_away": exp_away,
+        })
+
+        ratings[home_id] = home_rating + k_eff * (actual_home - exp_home)
+        ratings[away_id] = away_rating + k_eff * (actual_away - exp_away)
+
+    return pd.DataFrame(rows)
+
+
+def build_model_dataset(matches_finished: pd.DataFrame, team_features: pd.DataFrame) -> pd.DataFrame:
+    match_cols = [
+        "match_id", "competition_code", "competition_name", "season_start_year", "utc_date", "matchday",
+        "home_team_id", "home_team_name", "away_team_id", "away_team_name", "ft_home_goals", "ft_away_goals",
+        "ht_home_goals", "ht_away_goals", "sh_home_goals", "sh_away_goals"
+    ]
+    base = matches_finished[match_cols].copy()
+    feature_cols = [c for c in team_features.columns if c.startswith("roll") or c == "days_rest"]
+    home_features = team_features[team_features["is_home"].eq(1)][["match_id", "team_id"] + feature_cols].rename(
+        columns={c: f"home_{c}" for c in feature_cols}
+    ).rename(columns={"team_id": "home_team_id_check"})
+    away_features = team_features[team_features["is_home"].eq(0)][["match_id", "team_id"] + feature_cols].rename(
+        columns={c: f"away_{c}" for c in feature_cols}
+    ).rename(columns={"team_id": "away_team_id_check"})
+    df = base.merge(home_features, on="match_id", how="left").merge(away_features, on="match_id", how="left")
+
+    # MEC-1.1: rating Elo prepartido sin leakage.
+    elo_features = build_elo_features(matches_finished)
+    df = df.merge(elo_features, on="match_id", how="left")
+
+    for c in feature_cols:
+        df[f"diff_{c}"] = df[f"home_{c}"] - df[f"away_{c}"]
+    df["home_advantage"] = 1
+    df["total_goals"] = df["ft_home_goals"] + df["ft_away_goals"]
+    df["actual_result"] = np.select(
+        [df["ft_home_goals"] > df["ft_away_goals"], df["ft_home_goals"] == df["ft_away_goals"]],
+        ["H", "D"], default="A"
+    )
+    return df.sort_values(["utc_date", "match_id"]).reset_index(drop=True)
+
+
+def get_feature_columns(model_df: pd.DataFrame) -> Tuple[List[str], List[str], List[str]]:
+    exclude = {
+        "match_id", "competition_name", "utc_date", "home_team_id", "home_team_name", "away_team_id", "away_team_name",
+        "ft_home_goals", "ft_away_goals", "ht_home_goals", "ht_away_goals", "sh_home_goals", "sh_away_goals",
+        "total_goals", "actual_result"
+    }
+    categorical_cols = ["competition_code"]
+    numeric_cols = [c for c in model_df.columns if c not in exclude and c not in categorical_cols and pd.api.types.is_numeric_dtype(model_df[c])]
+    return numeric_cols + categorical_cols, numeric_cols, categorical_cols
+
+
+def temporal_train_test_split(df: pd.DataFrame, test_size: float = 0.20, min_train_matches: int = 500) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    df = df.sort_values(["utc_date", "match_id"]).reset_index(drop=True)
+    split_idx = int(len(df) * (1 - test_size))
+    if split_idx < min_train_matches and len(df) >= min_train_matches + 50:
+        split_idx = min_train_matches
+    train, test = df.iloc[:split_idx].copy(), df.iloc[split_idx:].copy()
+    if train.empty or test.empty:
+        raise ValueError("Split inválido: train o test quedó vacío. Descarga más temporadas/ligas.")
+    return train, test
+
+
+def build_preprocessor(numeric_cols: List[str], categorical_cols: List[str]) -> ColumnTransformer:
+    try:
+        onehot = OneHotEncoder(handle_unknown="ignore", sparse_output=False)
+    except TypeError:
+        onehot = OneHotEncoder(handle_unknown="ignore", sparse=False)
+    numeric_pipeline = Pipeline([("imputer", SimpleImputer(strategy="median")), ("scaler", StandardScaler())])
+    categorical_pipeline = Pipeline([("imputer", SimpleImputer(strategy="most_frequent")), ("onehot", onehot)])
+    return ColumnTransformer([("num", numeric_pipeline, numeric_cols), ("cat", categorical_pipeline, categorical_cols)], remainder="drop")
+
+
+def build_poisson_model(numeric_cols: List[str], categorical_cols: List[str], alpha: float = 0.01) -> Pipeline:
+    return Pipeline([("preprocessor", build_preprocessor(numeric_cols, categorical_cols)), ("model", PoissonRegressor(alpha=alpha, max_iter=2000))])
+
+
+TARGETS = ["ht_home_goals", "ht_away_goals", "sh_home_goals", "sh_away_goals"]
+
+
+def fit_mec1_models(train_df: pd.DataFrame, numeric_cols: List[str], categorical_cols: List[str], alpha: float = 0.01) -> Dict[str, Pipeline]:
+    models: Dict[str, Pipeline] = {}
+    X = train_df[numeric_cols + categorical_cols].copy()
+    for target in TARGETS:
+        model = build_poisson_model(numeric_cols, categorical_cols, alpha=alpha)
+        model.fit(X, train_df[target].astype(float))
+        models[target] = model
+    return models
+
+
+def predict_lambdas(models: Dict[str, Pipeline], df: pd.DataFrame, numeric_cols: List[str], categorical_cols: List[str]) -> pd.DataFrame:
+    pred = df.copy()
+    X = pred[numeric_cols + categorical_cols].copy()
+    for target, model in models.items():
+        pred[f"lambda_{target}"] = np.clip(model.predict(X), 0.01, 6.0)
+    pred["lambda_ft_home_goals"] = pred["lambda_ht_home_goals"] + pred["lambda_sh_home_goals"]
+    pred["lambda_ft_away_goals"] = pred["lambda_ht_away_goals"] + pred["lambda_sh_away_goals"]
+    pred["lambda_total_goals"] = pred["lambda_ft_home_goals"] + pred["lambda_ft_away_goals"]
+    return pred
+
+
+def dixon_coles_tau(home_goals: int, away_goals: int, lambda_home: float, lambda_away: float, rho: float) -> float:
+    """
+    Ajuste Dixon-Coles para marcadores bajos.
+
+    rho suele ser pequeño. Valores negativos tienden a aumentar algunos empates bajos;
+    el parámetro debe calibrarse en MEC-1.2, pero en MEC-1.1 lo dejamos configurable.
+    """
+    if home_goals == 0 and away_goals == 0:
+        return 1.0 - (lambda_home * lambda_away * rho)
+    if home_goals == 0 and away_goals == 1:
+        return 1.0 + (lambda_home * rho)
+    if home_goals == 1 and away_goals == 0:
+        return 1.0 + (lambda_away * rho)
+    if home_goals == 1 and away_goals == 1:
+        return 1.0 - rho
+    return 1.0
+
+
+def poisson_score_matrix(
+    lambda_home: float,
+    lambda_away: float,
+    max_goals: int = 8,
+    use_dixon_coles: bool = True,
+    rho: float = -0.05,
+) -> pd.DataFrame:
+    home_probs = poisson.pmf(np.arange(max_goals + 1), lambda_home)
+    away_probs = poisson.pmf(np.arange(max_goals + 1), lambda_away)
+    matrix = np.outer(home_probs, away_probs)
+
+    if use_dixon_coles:
+        for h in range(min(2, max_goals + 1)):
+            for a in range(min(2, max_goals + 1)):
+                matrix[h, a] *= max(dixon_coles_tau(h, a, lambda_home, lambda_away, rho), 0.001)
+
+    matrix = matrix / matrix.sum()
+
+    rows = []
+    for h in range(max_goals + 1):
+        for a in range(max_goals + 1):
+            rows.append({
+                "home_goals": h,
+                "away_goals": a,
+                "scoreline": f"{h}-{a}",
+                "probability": float(matrix[h, a]),
+                "result": "H" if h > a else "D" if h == a else "A",
+                "total_goals": h + a,
+                "btts": int(h > 0 and a > 0),
+            })
+    return pd.DataFrame(rows).sort_values("probability", ascending=False).reset_index(drop=True)
+
+
+def summarize_score_matrix(matrix: pd.DataFrame) -> Dict[str, float | str]:
+    """
+    Resume una matriz de marcadores.
+
+    MEC-1.2 agrega métricas de concentración/diversidad para detectar
+    si el marcador top es realmente fuerte o si la distribución está muy repartida.
+    """
+    top3 = matrix.head(3)
+    probs = matrix["probability"].astype(float).clip(lower=1e-15)
+    entropy = float(-(probs * np.log(probs)).sum())
+    max_entropy = float(np.log(len(probs))) if len(probs) else np.nan
+    entropy_norm = float(entropy / max_entropy) if max_entropy and max_entropy > 0 else np.nan
+    top3_prob_sum = float(top3["probability"].sum())
+    top1_prob = float(top3.iloc[0]["probability"])
+
+    return {
+        "prob_home_win": float(matrix.loc[matrix["result"].eq("H"), "probability"].sum()),
+        "prob_draw": float(matrix.loc[matrix["result"].eq("D"), "probability"].sum()),
+        "prob_away_win": float(matrix.loc[matrix["result"].eq("A"), "probability"].sum()),
+        "prob_over_05": float(matrix.loc[matrix["total_goals"] > 0.5, "probability"].sum()),
+        "prob_over_15": float(matrix.loc[matrix["total_goals"] > 1.5, "probability"].sum()),
+        "prob_over_25": float(matrix.loc[matrix["total_goals"] > 2.5, "probability"].sum()),
+        "prob_over_35": float(matrix.loc[matrix["total_goals"] > 3.5, "probability"].sum()),
+        "prob_btts": float(matrix.loc[matrix["btts"].eq(1), "probability"].sum()),
+        "top_scoreline": top3.iloc[0]["scoreline"],
+        "top_scoreline_prob": top1_prob,
+        "top3_scorelines": " | ".join(top3["scoreline"].tolist()),
+        "top3_scoreline_probs": " | ".join([f"{p:.3f}" for p in top3["probability"].tolist()]),
+        "top3_scoreline_prob_sum": top3_prob_sum,
+        "scoreline_entropy": entropy,
+        "scoreline_entropy_norm": entropy_norm,
+        "scoreline_concentration_top1": top1_prob,
+        "scoreline_concentration_top3": top3_prob_sum,
+    }
+
+
+def apply_result_probability_calibration(
+    df: pd.DataFrame,
+    factors: Optional[Dict[str, float]] = None,
+    prob_prefix: str = "ft",
+) -> pd.DataFrame:
+    """
+    Aplica calibración multiplicativa a probabilidades H/D/A y renormaliza.
+
+    Esta calibración no fuerza resultados; solo corrige sesgos agregados detectados
+    en una muestra de calibración temporal dentro del train.
+    """
+    out = df.copy()
+    if not factors:
+        factors = {"H": 1.0, "D": 1.0, "A": 1.0}
+
+    cols = {
+        "H": f"{prob_prefix}_prob_home_win",
+        "D": f"{prob_prefix}_prob_draw",
+        "A": f"{prob_prefix}_prob_away_win",
+    }
+
+    raw = np.column_stack([
+        out[cols["H"]].astype(float).values * float(factors.get("H", 1.0)),
+        out[cols["D"]].astype(float).values * float(factors.get("D", 1.0)),
+        out[cols["A"]].astype(float).values * float(factors.get("A", 1.0)),
+    ])
+    raw = np.clip(raw, 1e-9, None)
+    raw = raw / raw.sum(axis=1, keepdims=True)
+
+    out[cols["H"]] = raw[:, 0]
+    out[cols["D"]] = raw[:, 1]
+    out[cols["A"]] = raw[:, 2]
+    return out
+
+
+def calibrate_score_matrix_by_result(
+    matrix: pd.DataFrame,
+    factors: Optional[Dict[str, float]] = None,
+) -> pd.DataFrame:
+    """
+    Calibra la matriz completa de marcadores por clase H/D/A.
+
+    Esto mantiene consistencia entre probabilidad 1X2 y scorelines: si el empate
+    se corrige al alza, todos los scorelines empatados se ajustan, no solo la
+    columna agregada ft_prob_draw.
+    """
+    if not factors:
+        return matrix
+    out = matrix.copy()
+    out["probability"] = out.apply(
+        lambda r: float(r["probability"]) * float(factors.get(r["result"], 1.0)),
+        axis=1,
+    )
+    total = float(out["probability"].sum())
+    if total <= 0 or not np.isfinite(total):
+        return matrix
+    out["probability"] = out["probability"] / total
+    return out.sort_values("probability", ascending=False).reset_index(drop=True)
+
+
+def fit_result_probability_calibrator(
+    calib_pred: pd.DataFrame,
+    max_factor_delta: float = 0.35,
+) -> Dict[str, float]:
+    """
+    Calcula factores H/D/A observados vs predichos en una muestra de calibración.
+
+    Factor clase = frecuencia_observada / probabilidad_promedio_predicha.
+    Se acota para evitar correcciones agresivas con muestras pequeñas.
+    """
+    if calib_pred.empty or "actual_result" not in calib_pred.columns:
+        return {"H": 1.0, "D": 1.0, "A": 1.0}
+
+    mapping = {
+        "H": "ft_prob_home_win",
+        "D": "ft_prob_draw",
+        "A": "ft_prob_away_win",
+    }
+    factors: Dict[str, float] = {}
+    lower = 1.0 - max_factor_delta
+    upper = 1.0 + max_factor_delta
+
+    for result, col in mapping.items():
+        observed = float(calib_pred["actual_result"].eq(result).mean())
+        predicted = float(calib_pred[col].mean())
+        raw_factor = observed / max(predicted, 1e-6)
+        factors[result] = float(np.clip(raw_factor, lower, upper))
+
+    return factors
+
+
+def result_log_loss_from_probs(df: pd.DataFrame) -> float:
+    """Log loss 1X2 para comparar configuraciones en calibración."""
+    eps = 1e-12
+    prob_actual = np.select(
+        [df["actual_result"].eq("H"), df["actual_result"].eq("D"), df["actual_result"].eq("A")],
+        [df["ft_prob_home_win"], df["ft_prob_draw"], df["ft_prob_away_win"]],
+        default=np.nan,
+    )
+    return float(-np.nanmean(np.log(np.clip(prob_actual, eps, 1.0))))
+
+
+def calibrate_dixon_coles_rho(
+    calib_lambdas: pd.DataFrame,
+    candidate_rhos: Iterable[float] = (-0.15, -0.10, -0.075, -0.05, -0.025, 0.0, 0.025, 0.05),
+    max_goals: int = 8,
+) -> float:
+    """
+    Selecciona rho Dixon-Coles en una muestra de calibración temporal.
+
+    Mantiene el modelo explicable: prueba una grilla pequeña y elige el rho
+    con menor log loss 1X2. Si no hay data suficiente, vuelve a -0.05.
+    """
+    if calib_lambdas.empty or "actual_result" not in calib_lambdas.columns:
+        return -0.05
+
+    best_rho = -0.05
+    best_loss = np.inf
+    for rho in candidate_rhos:
+        pred = add_probabilistic_outputs(
+            calib_lambdas,
+            max_goals=max_goals,
+            use_dixon_coles=True,
+            dixon_coles_rho=float(rho),
+            probability_calibration_factors=None,
+            add_decision_layers=False,
+        )
+        loss = result_log_loss_from_probs(pred)
+        if np.isfinite(loss) and loss < best_loss:
+            best_loss = loss
+            best_rho = float(rho)
+    return best_rho
+
+
+def classify_prediction_confidence(row: pd.Series) -> str:
+    probs = np.array([row["ft_prob_home_win"], row["ft_prob_draw"], row["ft_prob_away_win"]], dtype=float)
+    ordered = np.sort(probs)[::-1]
+    margin = ordered[0] - ordered[1]
+    if margin < 0.035:
+        return "Muy incierto"
+    if margin < 0.070:
+        return "Incierto"
+    if ordered[0] < 0.45:
+        return "Sin favorito claro"
+    if ordered[0] < 0.55:
+        return "Favorito moderado"
+    return "Favorito claro"
+
+
+def classify_draw_risk(prob_draw: float) -> str:
+    if prob_draw >= 0.30:
+        return "Alto"
+    if prob_draw >= 0.25:
+        return "Medio"
+    if prob_draw >= 0.20:
+        return "Bajo"
+    return "Muy bajo"
+
+
+def classify_scoreline_diversity(entropy_norm: float, top3_sum: float) -> str:
+    """Etiqueta si la matriz de marcadores está concentrada o repartida."""
+    if pd.isna(entropy_norm):
+        return "Sin clasificar"
+    if top3_sum >= 0.36 or entropy_norm < 0.62:
+        return "Baja"
+    if top3_sum >= 0.27 or entropy_norm < 0.72:
+        return "Media"
+    return "Alta"
+
+
+def build_result_decision_layers(row: pd.Series) -> Dict[str, str | float | int]:
+    """
+    MEC-1.2: crea una salida honesta para partidos cerrados.
+
+    En fútbol el empate rara vez gana por argmax, pero es muy frecuente.
+    Por eso se genera una banda de resultado: H/D, A/D, H/A o H/D/A.
+    """
+    probs = {
+        "H": float(row["ft_prob_home_win"]),
+        "D": float(row["ft_prob_draw"]),
+        "A": float(row["ft_prob_away_win"]),
+    }
+    ordered = sorted(probs.items(), key=lambda kv: kv[1], reverse=True)
+    primary, primary_prob = ordered[0]
+    secondary, secondary_prob = ordered[1]
+    third, third_prob = ordered[2]
+    margin = primary_prob - secondary_prob
+    draw_gap_to_primary = primary_prob - probs["D"]
+
+    band = [primary]
+
+    # Partidos muy cerrados: incluir segunda opción.
+    if margin < 0.070:
+        band.append(secondary)
+
+    # Si el empate no es argmax, pero está cerca o con probabilidad alta, se expone.
+    if primary != "D" and probs["D"] >= 0.24 and draw_gap_to_primary <= 0.12:
+        band.append("D")
+
+    # Si todo está comprimido, mostrar triple banda.
+    if (primary_prob - third_prob) < 0.10 and probs["D"] >= 0.22:
+        band = [primary, secondary, third]
+
+    # Mantener orden H/D/A legible, pero con primary primero.
+    band_unique = []
+    for item in band:
+        if item not in band_unique:
+            band_unique.append(item)
+
+    result_band = "/".join(band_unique)
+
+    if primary == "D":
+        match_type = "Equilibrado con empate como escenario principal"
+    elif len(band_unique) >= 3:
+        match_type = "Muy abierto e incierto"
+    elif "D" in band_unique and primary == "H":
+        match_type = "Cerrado con sesgo local"
+    elif "D" in band_unique and primary == "A":
+        match_type = "Cerrado con sesgo visitante"
+    elif primary == "H" and primary_prob >= 0.55:
+        match_type = "Favorito local claro"
+    elif primary == "A" and primary_prob >= 0.55:
+        match_type = "Favorito visitante claro"
+    elif primary == "H":
+        match_type = "Sesgo local moderado"
+    else:
+        match_type = "Sesgo visitante moderado"
+
+    return {
+        "primary_result": primary,
+        "secondary_result": secondary,
+        "third_result": third,
+        "primary_result_prob": primary_prob,
+        "secondary_result_prob": secondary_prob,
+        "result_band": result_band,
+        "result_band_size": len(band_unique),
+        "result_band_includes_draw": int("D" in band_unique),
+        "match_type": match_type,
+        "draw_adjusted_probability": probs["D"],
+        "draw_gap_to_primary": draw_gap_to_primary,
+    }
+
+
+def add_probabilistic_outputs(
+    pred_df: pd.DataFrame,
+    max_goals: int = 8,
+    use_dixon_coles: bool = True,
+    dixon_coles_rho: float = -0.05,
+    probability_calibration_factors: Optional[Dict[str, float]] = None,
+    add_decision_layers: bool = True,
+) -> pd.DataFrame:
+    rows = []
+    for _, r in pred_df.iterrows():
+        matrix_ft = poisson_score_matrix(
+            r["lambda_ft_home_goals"],
+            r["lambda_ft_away_goals"],
+            max_goals=max_goals,
+            use_dixon_coles=use_dixon_coles,
+            rho=dixon_coles_rho,
+        )
+        matrix_ht = poisson_score_matrix(
+            r["lambda_ht_home_goals"],
+            r["lambda_ht_away_goals"],
+            max_goals=max_goals,
+            use_dixon_coles=use_dixon_coles,
+            rho=dixon_coles_rho,
+        )
+
+        # MEC-1.2: calibración coherente sobre la matriz completa FT.
+        # HT se deja sin calibración de 1X2 por ahora.
+        matrix_ft = calibrate_score_matrix_by_result(matrix_ft, probability_calibration_factors)
+
+        ft = summarize_score_matrix(matrix_ft)
+        ht = summarize_score_matrix(matrix_ht)
+        rows.append({
+            "match_id": r["match_id"],
+            **{f"ft_{k}": v for k, v in ft.items()},
+            **{f"ht_{k}": v for k, v in ht.items()},
+        })
+
+    out = pred_df.merge(pd.DataFrame(rows), on="match_id", how="left")
+
+    prob_cols = ["ft_prob_home_win", "ft_prob_draw", "ft_prob_away_win"]
+    out["predicted_result"] = out[prob_cols].idxmax(axis=1).map({
+        "ft_prob_home_win": "H",
+        "ft_prob_draw": "D",
+        "ft_prob_away_win": "A",
+    })
+    out["prediction_confidence"] = out.apply(classify_prediction_confidence, axis=1)
+    out["prediction_margin"] = out[prob_cols].apply(lambda s: float(np.sort(s.values)[-1] - np.sort(s.values)[-2]), axis=1)
+    out["draw_risk"] = out["ft_prob_draw"].map(classify_draw_risk)
+    out["ft_scoreline_diversity"] = [
+        classify_scoreline_diversity(ent, top3)
+        for ent, top3 in zip(out["ft_scoreline_entropy_norm"], out["ft_top3_scoreline_prob_sum"])
+    ]
+
+    if add_decision_layers:
+        decision_rows = out.apply(build_result_decision_layers, axis=1).apply(pd.Series)
+        out = pd.concat([out, decision_rows], axis=1)
+    else:
+        out["primary_result"] = out["predicted_result"]
+        out["secondary_result"] = np.nan
+        out["third_result"] = np.nan
+        out["primary_result_prob"] = out[prob_cols].max(axis=1)
+        out["secondary_result_prob"] = np.nan
+        out["result_band"] = out["predicted_result"]
+        out["result_band_size"] = 1
+        out["result_band_includes_draw"] = out["predicted_result"].eq("D").astype(int)
+        out["match_type"] = "Sin capa de decisión"
+        out["draw_adjusted_probability"] = out["ft_prob_draw"]
+        out["draw_gap_to_primary"] = out[prob_cols].max(axis=1) - out["ft_prob_draw"]
+
+    return out
+
+
+def evaluate_predictions(pred_df: pd.DataFrame) -> pd.DataFrame:
+    df = pred_df.copy()
+    prob_actual = np.select(
+        [df["actual_result"].eq("H"), df["actual_result"].eq("D"), df["actual_result"].eq("A")],
+        [df["ft_prob_home_win"], df["ft_prob_draw"], df["ft_prob_away_win"]], default=np.nan
+    )
+    eps = 1e-12
+    df["actual_scoreline"] = df["ft_home_goals"].astype(str) + "-" + df["ft_away_goals"].astype(str)
+    top3_hit = np.mean([actual in str(top3).split(" | ") for actual, top3 in zip(df["actual_scoreline"], df["ft_top3_scorelines"])])
+
+    if "result_band" in df.columns:
+        band_hit = np.mean([
+            actual in str(band).split("/")
+            for actual, band in zip(df["actual_result"], df["result_band"])
+        ])
+        avg_band_size = float(df["result_band_size"].mean()) if "result_band_size" in df.columns else np.nan
+        draw_band_share = float(df["result_band_includes_draw"].mean()) if "result_band_includes_draw" in df.columns else np.nan
+    else:
+        band_hit = np.nan
+        avg_band_size = np.nan
+        draw_band_share = np.nan
+
+    return pd.DataFrame([{
+        "n_matches_test": len(df),
+        "log_loss_1x2": -np.nanmean(np.log(np.clip(prob_actual, eps, 1))),
+        "brier_score_1x2": np.mean(
+            (df["ft_prob_home_win"] - df["actual_result"].eq("H").astype(int)) ** 2 +
+            (df["ft_prob_draw"] - df["actual_result"].eq("D").astype(int)) ** 2 +
+            (df["ft_prob_away_win"] - df["actual_result"].eq("A").astype(int)) ** 2
+        ) / 3,
+        "accuracy_1x2": np.mean(df["actual_result"].eq(df["predicted_result"])),
+        "result_band_hit_rate": band_hit,
+        "avg_result_band_size": avg_band_size,
+        "draw_band_share": draw_band_share,
+        "avg_prob_home_win": float(df["ft_prob_home_win"].mean()),
+        "avg_prob_draw": float(df["ft_prob_draw"].mean()),
+        "avg_prob_away_win": float(df["ft_prob_away_win"].mean()),
+        "actual_home_win_rate": float(df["actual_result"].eq("H").mean()),
+        "actual_draw_rate": float(df["actual_result"].eq("D").mean()),
+        "actual_away_win_rate": float(df["actual_result"].eq("A").mean()),
+        "mae_ft_home_goals": np.mean(np.abs(df["lambda_ft_home_goals"] - df["ft_home_goals"])),
+        "mae_ft_away_goals": np.mean(np.abs(df["lambda_ft_away_goals"] - df["ft_away_goals"])),
+        "exact_scoreline_top1_rate": np.mean(df["actual_scoreline"].eq(df["ft_top_scoreline"])),
+        "exact_scoreline_top3_rate": top3_hit,
+        "avg_ft_top_scoreline_prob": float(df["ft_top_scoreline_prob"].mean()),
+        "avg_ft_top3_scoreline_prob_sum": float(df["ft_top3_scoreline_prob_sum"].mean()) if "ft_top3_scoreline_prob_sum" in df.columns else np.nan,
+        "avg_ft_scoreline_entropy_norm": float(df["ft_scoreline_entropy_norm"].mean()) if "ft_scoreline_entropy_norm" in df.columns else np.nan,
+    }])
+
+
+def evaluate_by_competition(pred_df: pd.DataFrame) -> pd.DataFrame:
+    rows = []
+    for comp, g in pred_df.groupby("competition_code", dropna=False):
+        metrics = evaluate_predictions(g)
+        metrics.insert(0, "competition_code", comp)
+        rows.append(metrics)
+    return pd.concat(rows, ignore_index=True) if rows else pd.DataFrame()
+
+
+def snapshot_team_features(team_long: pd.DataFrame, team_id: int, as_of_date: pd.Timestamp, is_home: int, windows: Tuple[int, ...] = (5, 10)) -> Dict[str, float]:
+    hist = team_long[(team_long["team_id"].eq(team_id)) & (team_long["utc_date"] < as_of_date)].sort_values("utc_date")
+    hist_ha = hist[hist["is_home"].eq(is_home)]
+    out = {"days_rest": np.nan if hist.empty else min(max((as_of_date - hist["utc_date"].max()).total_seconds() / 86400.0, 0), 30)}
+    for w in windows:
+        tail = hist.tail(w)
+        tail_ha = hist_ha.tail(w)
+        for col in BASE_PERFORMANCE_COLS:
+            out[f"roll{w}_{col}"] = tail[col].mean() if len(tail) else np.nan
+            out[f"roll{w}_ha_{col}"] = tail_ha[col].mean() if len(tail_ha) else np.nan
+    return out
+
+
+def build_fixture_prediction_dataset(fixtures: pd.DataFrame, team_long_finished: pd.DataFrame, windows: Tuple[int, ...] = (5, 10)) -> pd.DataFrame:
+    rows = []
+    for _, m in fixtures.iterrows():
+        home = snapshot_team_features(team_long_finished, m["home_team_id"], m["utc_date"], 1, windows)
+        away = snapshot_team_features(team_long_finished, m["away_team_id"], m["utc_date"], 0, windows)
+        row = {
+            "match_id": m["match_id"], "competition_code": m["competition_code"], "competition_name": m.get("competition_name"),
+            "season_start_year": m.get("season_start_year"), "utc_date": m["utc_date"], "matchday": m.get("matchday"),
+            "home_team_id": m["home_team_id"], "home_team_name": m["home_team_name"],
+            "away_team_id": m["away_team_id"], "away_team_name": m["away_team_name"], "home_advantage": 1,
+        }
+        for k, v in home.items():
+            row[f"home_{k}"] = v
+        for k, v in away.items():
+            row[f"away_{k}"] = v
+        for k in home.keys():
+            row[f"diff_{k}"] = home.get(k, np.nan) - away.get(k, np.nan)
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def build_scoreline_matrix_for_match(
+    pred_row: pd.Series,
+    half: str = "ft",
+    max_goals: int = 8,
+    use_dixon_coles: bool = True,
+    dixon_coles_rho: float = -0.05,
+) -> pd.DataFrame:
+    if half == "ft":
+        lh, la = pred_row["lambda_ft_home_goals"], pred_row["lambda_ft_away_goals"]
+    elif half == "ht":
+        lh, la = pred_row["lambda_ht_home_goals"], pred_row["lambda_ht_away_goals"]
+    else:
+        raise ValueError("half debe ser 'ft' o 'ht'.")
+    matrix = poisson_score_matrix(lh, la, max_goals=max_goals, use_dixon_coles=use_dixon_coles, rho=dixon_coles_rho)
+    matrix.insert(0, "half", half)
+    matrix.insert(0, "away_team_name", pred_row.get("away_team_name"))
+    matrix.insert(0, "home_team_name", pred_row.get("home_team_name"))
+    matrix.insert(0, "match_id", pred_row["match_id"])
+    return matrix
+
+
+def make_excel_safe(df: pd.DataFrame) -> pd.DataFrame:
+    """Prepara un DataFrame para exportación a Excel."""
+    if df is None:
+        return df
+    df = df.copy()
+    for col in df.columns:
+        serie = df[col]
+        if isinstance(serie.dtype, pd.DatetimeTZDtype):
+            df[col] = serie.dt.tz_convert(None)
+            continue
+        if pd.api.types.is_datetime64_any_dtype(serie):
+            continue
+        if serie.dtype == "object":
+            sample = serie.dropna().head(50)
+            if sample.empty:
+                continue
+            has_complex = sample.map(lambda x: isinstance(x, (list, dict, tuple, set))).any()
+            if has_complex:
+                df[col] = df[col].map(lambda x: str(x) if isinstance(x, (list, dict, tuple, set)) else x)
+                serie = df[col]
+                sample = serie.dropna().head(50)
+            has_tz = sample.map(lambda x: getattr(x, "tzinfo", None) is not None).any()
+            if has_tz:
+                df[col] = pd.to_datetime(df[col], errors="coerce", utc=True).dt.tz_convert(None)
+    return df
+
+
+def export_mec1_excel(
+    output_path: Path,
+    predictions: pd.DataFrame,
+    metrics_global: pd.DataFrame,
+    metrics_by_comp: pd.DataFrame,
+    model_dataset: Optional[pd.DataFrame] = None,
+    max_matrix_matches: int = 5,
+) -> Path:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    pred_cols_priority = [
+        "match_id", "utc_date", "competition_code", "home_team_name", "away_team_name",
+        "ft_home_goals", "ft_away_goals", "actual_result",
+        "home_elo_pre", "away_elo_pre", "elo_diff", "elo_diff_home_adj", "elo_expected_home",
+        "lambda_ft_home_goals", "lambda_ft_away_goals", "lambda_total_goals",
+        "lambda_ht_home_goals", "lambda_ht_away_goals", "lambda_sh_home_goals", "lambda_sh_away_goals",
+        "ft_top_scoreline", "ft_top_scoreline_prob", "ft_top3_scorelines", "ft_top3_scoreline_probs",
+        "ht_top_scoreline", "ht_top_scoreline_prob", "ht_top3_scorelines", "ht_top3_scoreline_probs",
+        "ft_prob_home_win", "ft_prob_draw", "ft_prob_away_win",
+        "ft_prob_over_15", "ft_prob_over_25", "ft_prob_over_35", "ft_prob_btts",
+        "predicted_result", "prediction_confidence", "prediction_margin", "draw_risk",
+        "primary_result", "secondary_result", "third_result", "primary_result_prob", "secondary_result_prob",
+        "result_band", "result_band_size", "result_band_includes_draw", "match_type",
+        "draw_adjusted_probability", "draw_gap_to_primary",
+        "ft_scoreline_diversity", "ft_top3_scoreline_prob_sum", "ft_scoreline_entropy_norm",
+    ]
+    pred_export = predictions[[c for c in pred_cols_priority if c in predictions.columns]].copy()
+
+    with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
+        make_excel_safe(pred_export).to_excel(writer, sheet_name="Resumen_Predicciones", index=False)
+        make_excel_safe(metrics_global).to_excel(writer, sheet_name="Backtesting_Global", index=False)
+        make_excel_safe(metrics_by_comp).to_excel(writer, sheet_name="Backtesting_Liga", index=False)
+
+        matrices = []
+        for _, row in predictions.head(max_matrix_matches).iterrows():
+            matrices.append(build_scoreline_matrix_for_match(row, half="ft"))
+            matrices.append(build_scoreline_matrix_for_match(row, half="ht"))
+        if matrices:
+            matrix_export = pd.concat(matrices, ignore_index=True)
+            make_excel_safe(matrix_export).to_excel(writer, sheet_name="Matriz_Marcadores", index=False)
+
+        if model_dataset is not None:
+            sample_cols = [
+                c for c in model_dataset.columns
+                if c in [
+                    "match_id", "utc_date", "competition_code", "home_team_name", "away_team_name",
+                    "ft_home_goals", "ft_away_goals", "ht_home_goals", "ht_away_goals",
+                    "sh_home_goals", "sh_away_goals", "actual_result",
+                    "home_elo_pre", "away_elo_pre", "elo_diff", "elo_diff_home_adj", "elo_expected_home",
+                ]
+                or c.startswith("diff_roll5")
+                or c.startswith("diff_roll10")
+            ]
+            features_export = model_dataset[sample_cols].head(5000).copy()
+            make_excel_safe(features_export).to_excel(writer, sheet_name="Features_Muestra", index=False)
+
+    return output_path
+
+def run_mec1_pipeline(
+    project_root: Optional[Path] = None,
+    competitions: Iterable[str] = DEFAULT_COMPETITIONS,
+    seasons: Iterable[int] = (2021, 2022, 2023, 2024, 2025),
+    test_size: float = 0.20,
+    force_extract: bool = False,
+    api_token: Optional[str] = None,
+) -> Dict[str, object]:
+    project_root = project_root or resolve_project_root()
+    paths = ensure_project_dirs(project_root)
+    print("PROJECT_ROOT:", project_root)
+    print("MODEL_VERSION: MEC-1.2")
+
+    env_path = project_root / ".env"
+    if env_path.exists():
+        try:
+            from dotenv import load_dotenv
+            load_dotenv(env_path)
+            print(f"[ENV] .env cargado: {env_path}")
+        except ImportError:
+            print("[WARN] Existe .env, pero falta instalar python-dotenv: pip install python-dotenv")
+
+    client = FootballDataClient(api_token=api_token)
+    raw_files = fetch_competition_matches(client, competitions, seasons, paths["raw_football_data"], force=force_extract)
+    matches = normalize_football_data_matches(raw_files)
+    save_parquet_gzip(matches, parquet_gzip_path(paths["bronze"], "matches_football_data"))
+    print(f"[BRONZE] matches: {matches.shape}")
+
+    matches_finished = filter_finished_matches(matches)
+    team_long = build_team_match_long(matches_finished)
+    team_features = add_rolling_team_features(team_long)
+    save_parquet_gzip(matches_finished, parquet_gzip_path(paths["silver"], "matches_finished"))
+    save_parquet_gzip(team_long, parquet_gzip_path(paths["silver"], "team_match_long"))
+    save_parquet_gzip(team_features, parquet_gzip_path(paths["silver"], "team_features_rolling"))
+    print(f"[SILVER] matches_finished: {matches_finished.shape}")
+    print(f"[SILVER] team_features: {team_features.shape}")
+
+    model_dataset = build_model_dataset(matches_finished, team_features)
+    save_parquet_gzip(model_dataset, parquet_gzip_path(paths["gold"], "model_dataset_mec1"))
+    _, numeric_cols, categorical_cols = get_feature_columns(model_dataset)
+    train_df, test_df = temporal_train_test_split(model_dataset, test_size=test_size)
+    print(f"[TRAIN] {train_df.shape} | [TEST] {test_df.shape}")
+    print(f"[FEATURES] numeric={len(numeric_cols)} categorical={categorical_cols}")
+
+    # MEC-1.2: calibración temporal dentro del train.
+    train_core_df, calib_df = temporal_train_test_split(train_df, test_size=0.20, min_train_matches=300)
+    print(f"[CALIBRATION] train_core={train_core_df.shape} | calib={calib_df.shape}")
+
+    calibration_models = fit_mec1_models(train_core_df, numeric_cols, categorical_cols)
+    pred_calib_lambdas = predict_lambdas(calibration_models, calib_df, numeric_cols, categorical_cols)
+    best_rho = calibrate_dixon_coles_rho(pred_calib_lambdas)
+    pred_calib_uncalibrated = add_probabilistic_outputs(
+        pred_calib_lambdas,
+        dixon_coles_rho=best_rho,
+        probability_calibration_factors=None,
+        add_decision_layers=True,
+    )
+    probability_calibration_factors = fit_result_probability_calibrator(pred_calib_uncalibrated)
+    print(f"[CALIBRATION] best_dixon_coles_rho={best_rho}")
+    print(f"[CALIBRATION] probability_factors={probability_calibration_factors}")
+
+    # Entrenamiento final con todo el train y aplicación de calibradores al test.
+    models = fit_mec1_models(train_df, numeric_cols, categorical_cols)
+    pred_test = predict_lambdas(models, test_df, numeric_cols, categorical_cols)
+    pred_test = add_probabilistic_outputs(
+        pred_test,
+        dixon_coles_rho=best_rho,
+        probability_calibration_factors=probability_calibration_factors,
+        add_decision_layers=True,
+    )
+    metrics_global = evaluate_predictions(pred_test)
+    metrics_by_comp = evaluate_by_competition(pred_test)
+    save_parquet_gzip(pred_test, parquet_gzip_path(paths["gold"], "predictions_test_mec1_v12"))
+    save_parquet_gzip(metrics_global, parquet_gzip_path(paths["gold"], "metrics_global_mec1_v12"))
+    save_parquet_gzip(metrics_by_comp, parquet_gzip_path(paths["gold"], "metrics_by_competition_mec1_v12"))
+
+    excel_path = export_mec1_excel(paths["outputs_excel"] / "predicciones_mec1_v12.xlsx", pred_test, metrics_global, metrics_by_comp, model_dataset)
+    print("[EXPORT]", excel_path)
+    return {
+        "project_root": project_root,
+        "paths": paths,
+        "matches": matches,
+        "matches_finished": matches_finished,
+        "team_long": team_long,
+        "team_features": team_features,
+        "model_dataset": model_dataset,
+        "train_df": train_df,
+        "test_df": test_df,
+        "models": models,
+        "calibration_models": calibration_models,
+        "calib_df": calib_df,
+        "best_dixon_coles_rho": best_rho,
+        "probability_calibration_factors": probability_calibration_factors,
+        "pred_test": pred_test,
+        "metrics_global": metrics_global,
+        "metrics_by_comp": metrics_by_comp,
+        "excel_path": excel_path,
+        "numeric_cols": numeric_cols,
+        "categorical_cols": categorical_cols,
+    }
