@@ -6,6 +6,8 @@ A personal analytics project by **Diego Gallo**, combining data engineering, sta
 
 Orsay brings together a personal football-analytics project and its current technical evolution. Model logic, data preparation and evaluation remain reviewable in code and notebooks.
 
+[Business case](docs/CASE_STUDY.md) · [Interview walkthrough ES / EN](docs/INTERVIEW_ES_EN.md)
+
 ## What the project demonstrates
 
 - A raw → bronze → silver → gold data workflow.
@@ -63,9 +65,9 @@ See **[Running guide / Guía de ejecución](docs/RUNNING.md)** for Windows, macO
 
 ## Status and evaluation
 
-**Implemented in recovered code:** feature engineering, Elo, Poisson models, score distributions, temporal calibration, evaluation and Excel export. **Rechecked here:** the offline synthetic demo and the tests described in `docs/VALIDATION.md`.
+**Implemented in recovered code:** feature engineering, Elo, Poisson models, score distributions, temporal calibration, evaluation and Excel export. **Rechecked here:** the offline synthetic demo, a 380-match historical benchmark and the tests described in `docs/VALIDATION.md`.
 
-Historical predictive accuracy and financial returns are not asserted in this repository. A chronological benchmark against simple baselines and reproducible real-data evaluation remain the next substantive steps.
+Historical outcome accuracy and probability scores are reported for one holdout season in `docs/HISTORICAL_BENCHMARK.md`. They do not establish multi-season superiority or financial returns.
 
 **RBDT-26** belongs to Orsay's experimental research direction. No runnable RBDT-26 implementation was recovered in this package, so it is not presented as a validated feature of MEC-1.2.1. The original Orsay work and its current technical evolution remain one personal project, with their stages described honestly.
 
@@ -75,7 +77,7 @@ Orsay es mi proyecto propio de analítica de fútbol. MEC-1.2.1 combina preparac
 
 ## Data and publication
 
-Only generated demonstration data is included. No company datasets, credentials, private infrastructure or employer source code are included. API data should stay local unless redistribution rights are established. Source code is available for portfolio review; no open-source licence has been assigned.
+Generated demonstration data and public CC0 historical fixtures are included. No company datasets, credentials, private infrastructure or employer source code are included. API data should stay local unless redistribution rights are established. Source code is available for portfolio review; no open-source licence has been assigned.
 
 ## Clone this project
 
@@ -85,3 +87,7 @@ cd orsay-football-analytics
 ```
 
 Follow the run commands above from this folder.
+
+## Historical evidence
+
+[View the 380-match holdout comparison](docs/HISTORICAL_BENCHMARK.md) and [business case](docs/CASE_STUDY.md). Run `python examples/historical_benchmark.py` after installing `requirements.txt`. Public CC0 fixtures are included for reproducibility. Outcome scoring improves against the simple reference; goal-count error does not. No profitability claim is made.

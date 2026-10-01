@@ -37,3 +37,7 @@ The execution host lacked a separately installed `requests` package. For the off
 - Notebook execution outputs and bytecode caches were excluded.
 - A bounded scan found no employer-name references, common private IPv4 addresses or matching long credential literals in the prepared text files. This is a preparation check, not a security guarantee.
 - Generated data and prediction files are ignored by Git and excluded from the deliverable ZIP.
+
+## Portfolio v0.3.0
+
+Seven tests now cover the historical fixture contract, strictly separated seasons, probabilities and feature timing. The new benchmark fits on 760 matches and evaluates on 380; see `HISTORICAL_BENCHMARK.md`, CSV and manifest. API ingestion and the full calibrated notebook remain untested. Local imports used bundled pip-vendored Requests; GitHub CI installs ordinary requirements and reruns offline execution.

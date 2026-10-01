@@ -1,0 +1,40 @@
+{
+  "source": "OpenFootball football.json",
+  "data_license": "CC0-1.0",
+  "files": [
+    {
+      "season": "2022-23",
+      "sha256": "73bc0636479b185584772d250d61556ec6e79e8ecb2514dc256fe9204637033f",
+      "halftime_derived_from_scoreless_fulltime": 23,
+      "source": "https://github.com/openfootball/football.json/blob/master/2022-23/en.1.json"
+    },
+    {
+      "season": "2023-24",
+      "sha256": "b4f239cf2b6af8a76a844e027a10657441746427633fb5263e121e0ca4943ba2",
+      "halftime_derived_from_scoreless_fulltime": 11,
+      "source": "https://github.com/openfootball/football.json/blob/master/2023-24/en.1.json"
+    },
+    {
+      "season": "2024-25",
+      "sha256": "cc4a597fd69521ba0df379f358f3ec8b42f4c096e738bb2e2aa503671e495803",
+      "halftime_derived_from_scoreless_fulltime": 16,
+      "source": "https://github.com/openfootball/football.json/blob/master/2024-25/en.1.json"
+    }
+  ],
+  "training_seasons": [
+    "2022-23",
+    "2023-24"
+  ],
+  "test_season": "2024-25",
+  "n_train": 760,
+  "n_test": 380,
+  "mode": "Fixed model; prior observed results update rolling features and Elo during holdout",
+  "calibration": "None; alpha=0.01 and rho=-0.05 fixed",
+  "brier_definition": "Sum of squared H/D/A probability errors divided by 3",
+  "limitations": [
+    "Single league and holdout season; no statistical superiority established",
+    "Same-day team uniqueness checked; timestamps have calendar-day resolution",
+    "Recovered feature selection retains numeric team-check identifiers and year; ablation is future work",
+    "No odds, ROI, profitability, API, or RBDT-26 validation"
+  ]
+}

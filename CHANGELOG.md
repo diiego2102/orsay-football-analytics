@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.3.0
+
+Added a business case, bilingual interview preparation and GitHub verification workflow. Added CC0 historical fixtures and a reproducible 380-match benchmark. Original MEC source preserved.
+
+
 ## Portfolio 0.2.0 · 2026-10-01
 
 - Added bilingual laptop and Codespaces execution guide.
